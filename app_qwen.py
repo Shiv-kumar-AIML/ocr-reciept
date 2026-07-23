@@ -349,16 +349,55 @@ You are a receipt data extraction expert. Extract ALL purchased products from th
 ---END OCR TEXT---
 
 EXTRACTION RULES:
-1. IMAGE IS PRIMARY: Look at the image to understand the exact column structure of this receipt (Name | Qty | Price | Total). The receipt layout tells you where each value belongs.
-2. OCR TEXT IS REFERENCE: Use the OCR text to get exact spellings, numbers, and barcodes.
-3. PRODUCT NAME: Only the text name of the product. Do NOT include any numbers (qty/price/total) in the name.
-4. BARCODE: A long number (12-14 digits) printed ABOVE the product name line. Remove any '*' or '#'. If missing, use "".
-5. QUANTITY: The count or weight number ONLY — just the digit(s), e.g. "1", "3", "0.43". Do NOT include 'x', 'X', 'kg', or any unit.
-6. PRICE: The unit price column value (number only).
-7. TOTAL_AMOUNT: The line total column value (number only).
-8. Skip: store name, address, TRN, subtotals, taxes, payment lines, Arabic text, coupon lines.
-9. NEEDS_MANUAL_TALLY: Set to true if OCR text is garbled, values are unclear, or you had to guess. Otherwise false.
-10. CONFIDENCE: Be HONEST — give 100 only if every field (name, barcode, qty, price, total) is crystal clear. Give 70-90 if some values needed inference. Give below 70 if OCR was messy.
+1. IMAGE IS PRIMARY: Look at the image to understand the column structure of THIS receipt (Name | Qty | Price | Total). Every receipt may have a different layout — detect it from the image.
+2. OCR TEXT IS REFERENCE: Use the OCR text for exact spellings, numbers, and barcodes.
+3. PRODUCT NAME: Only the English text name. Do NOT include numbers (qty/price/total) in the name. Ignore Arabic lines — they are just translations.
+
+4. BARCODE RULE — CRITICAL: Barcodes can appear ABOVE OR BELOW the product name depending on the store. A barcode is a long number (10-14 digits). Study the image to detect which pattern this receipt uses:
+
+   PATTERN A — Barcode is ABOVE the product name (e.g. LuLu receipts):
+   ```
+   *6291102013508  1 x  13.90  S2       ← BARCODE LINE (with qty & price)
+   بيضي أبيض متوسط                     ← Arabic name (IGNORE)
+   Fadeel White Egg Medium 30s PD  13.90 ← PRODUCT NAME + total
+   ```
+   → product_name="Fadeel White Egg Medium 30s PD", barcode="6291102013508", quantity="1", price="13.90", total_amount="13.90"
+
+   ```
+   *2200013262374  3 X  0.50  S2        ← BARCODE LINE
+   سان ميجيل قهوة                       ← Arabic (IGNORE)
+   SanMig 3n1 CoffeeSugrFree7g(0)  1.50 ← PRODUCT NAME + total
+   ```
+   → product_name="SanMig 3n1 CoffeeSugrFree7g", barcode="2200013262374", quantity="3", price="0.50", total_amount="1.50"
+
+   PATTERN B — Barcode is BELOW the product name (e.g. Safeer, Nesto, Shaklan receipts):
+   ```
+   INDOMIE NOODLE FRIED 75GM  5%        ← PRODUCT NAME
+   الدومي نودلز                         ← Arabic (IGNORE)
+   089686120714  1.000  2.25  2.25      ← BARCODE + qty + price + total
+   ```
+   → product_name="INDOMIE NOODLE FRIED 75GM", barcode="089686120714", quantity="1", price="2.25", total_amount="2.25"
+
+   ```
+   BOYS DENIM SHIRT  5%                 ← PRODUCT NAME
+   تيشيرت جينز أولاد                   ← Arabic (IGNORE)
+   1334567053704  1.000  6.00  6.00     ← BARCODE + qty + price + total
+   ```
+   → product_name="BOYS DENIM SHIRT", barcode="1334567053704", quantity="1", price="6.00", total_amount="6.00"
+
+   PATTERN C — Barcode on separate line below (e.g. Nesto/Shaklan):
+   ```
+   T. Almarai Vetal Zab  1  2.25  2.25  ← PRODUCT NAME + qty + price + total
+   6281007064163                         ← BARCODE (next line, alone)
+   ```
+   → product_name="T. Almarai Vetal Zab", barcode="6281007064163", quantity="1", price="2.25", total_amount="2.25"
+
+5. QUANTITY: Pure digit only — e.g. "1", "3", "0.43", "1.15". NO 'x', 'X', 'kg', units.
+6. PRICE: Unit price number only.
+7. TOTAL_AMOUNT: Line total number only.
+8. Skip: store name, address, TRN, subtotals, taxes, payment lines, Arabic-only lines, coupon/loyalty lines.
+9. NEEDS_MANUAL_TALLY: true if any value was unclear or guessed. false if confident.
+10. CONFIDENCE: Be HONEST — 100 only if every field is crystal clear. 70-90 if some inference. Below 70 if OCR was messy.
 
 Return ONLY valid JSON, no markdown:
 {{"products": [{{"product_name": "string", "barcode": "string", "quantity": "string", "price": "string", "total_amount": "string", "needs_manual_tally": false, "confidence_percentage": 85}}]}}"""
