@@ -24,6 +24,7 @@ os.environ["FLAGS_use_mkldnn"] = "0"
 os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "0"
 
 from paddleocr import PaddleOCR
+from document_scanner import scan_and_crop_document, apply_clahe_enhancement
 
 # ============================================================
 # CONFIG
@@ -58,9 +59,13 @@ def get_ocr_model():
     return PaddleOCR(lang="en", use_textline_orientation=True, enable_mkldnn=False)
 
 
-def run_paddle_ocr(ocr_model, image_pil: Image.Image) -> list[str]:
-    """Run PaddleOCR on a PIL image. Returns list of text strings."""
-    # Convert PIL Image to OpenCV NumPy array to remove tempfile disk buffer
+def run_paddle_ocr_and_crop(ocr_model, image_pil: Image.Image) -> tuple[list[str], Image.Image]:
+    """
+    Production-Grade Neural Document Cropper & OCR:
+    Runs PaddleOCR's deep learning text detection model (PP-OCRv6).
+    Extracts text line bounding polygons to crop the image tightly around 100% of document content.
+    Returns (raw_text_lines, cropped_pil_image).
+    """
     img_array = np.array(image_pil)
     try:
         with warnings.catch_warnings():
@@ -71,21 +76,52 @@ def run_paddle_ocr(ocr_model, image_pil: Image.Image) -> list[str]:
                 result = ocr_model.ocr(img_array)
     except Exception as e:
         print(f"PaddleOCR error: {e}")
-        return []
+        return [], crop_document(image_pil)
 
     texts = []
-    if not result or len(result) == 0:
-        return texts
-    res = result[0]
-    if isinstance(res, dict) and 'rec_texts' in res:
-        texts.extend([t for t in res['rec_texts'] if t])
-    elif isinstance(res, list):
-        for line in res:
-            if isinstance(line, list) and len(line) == 2 and isinstance(line[1], tuple):
-                texts.append(line[1][0])
-            elif isinstance(line, str):
-                texts.append(line)
-    return texts
+    boxes = []
+    if result and len(result) > 0:
+        res = result[0]
+        if isinstance(res, dict):
+            if 'rec_texts' in res:
+                texts.extend([t for t in res['rec_texts'] if t])
+            if 'dt_polys' in res:
+                boxes = [np.array(p, dtype=np.int32) for p in res['dt_polys']]
+        elif isinstance(res, list):
+            for line in res:
+                if isinstance(line, list) and len(line) == 2:
+                    if isinstance(line[0], list):
+                        boxes.append(np.array(line[0], dtype=np.int32))
+                    if isinstance(line[1], tuple):
+                        texts.append(line[1][0])
+                elif isinstance(line, str):
+                    texts.append(line)
+
+    # Compute production-grade document crop from neural text detection boxes
+    if boxes:
+        h, w = img_array.shape[:2]
+        all_pts = np.vstack(boxes)
+        x1, y1 = np.min(all_pts, axis=0)
+        x2, y2 = np.max(all_pts, axis=0)
+
+        # 3.5% horizontal and 2% vertical padding
+        pad_x = int(w * 0.035)
+        pad_y = int(h * 0.02)
+
+        crop_x1 = max(0, int(x1) - pad_x)
+        crop_y1 = max(0, int(y1) - pad_y)
+        crop_x2 = min(w, int(x2) + pad_x)
+        crop_y2 = min(h, int(y2) + pad_y)
+
+        crop_w = crop_x2 - crop_x1
+        crop_h = crop_y2 - crop_y1
+
+        if crop_w > 50 and crop_h > 50:
+            cropped_np = img_array[crop_y1:crop_y2, crop_x1:crop_x2]
+            return texts, Image.fromarray(cropped_np)
+
+    # Fallback to hybrid paper cropper
+    return texts, crop_document(image_pil)
 
 
 def clean_lines(lines: list[str]) -> list[str]:
@@ -120,57 +156,83 @@ def stitch_images(pil_images: list[Image.Image]) -> Image.Image:
 
 
 def crop_document(pil_img: Image.Image) -> Image.Image:
-    """Detect document contours and apply perspective transform to crop."""
+    """
+    Robust Receipt Cropper:
+    Removes background margins (tables, bedsheets, floors, or wide margins)
+    around the receipt paper.
+    """
     img = np.array(pil_img)
-    # Convert RGB to BGR for OpenCV
-    img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    if img is None or img.size == 0:
+        return pil_img
+
+    img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR) if len(img.shape) == 3 and img.shape[2] == 3 else img
+    h, w = img_bgr.shape[:2]
+    total_area = w * h
+
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edged = cv2.Canny(blur, 75, 200)
 
-    contours, _ = cv2.findContours(edged.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
+    # --- METHOD 1: Otsu Bright Paper Segmentation ---
+    blur = cv2.GaussianBlur(gray, (15, 15), 0)
+    _, thresh_paper = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    kernel_paper = cv2.getStructuringElement(cv2.MORPH_RECT, (31, 31))
+    closed_paper = cv2.morphologyEx(thresh_paper, cv2.MORPH_CLOSE, kernel_paper)
 
-    doc_cnt = None
-    for c in contours:
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) == 4:
-            doc_cnt = approx
-            break
+    contours_paper, _ = cv2.findContours(closed_paper, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    paper_crop = None
+    if contours_paper:
+        c_paper = max(contours_paper, key=cv2.contourArea)
+        px, py, pw, ph = cv2.boundingRect(c_paper)
+        paper_area_ratio = (pw * ph) / total_area
+        
+        # If paper contour covers 10% to 88% of image, it successfully isolated receipt paper from background
+        if 0.10 <= paper_area_ratio <= 0.88:
+            pad_x = int(w * 0.015)
+            pad_y = int(h * 0.015)
+            x1 = max(0, px - pad_x)
+            y1 = max(0, py - pad_y)
+            x2 = min(w, px + pw + pad_x)
+            y2 = min(h, py + ph + pad_y)
+            paper_crop = (x1, y1, x2, y2)
 
-    if doc_cnt is not None:
-        pts = doc_cnt.reshape(4, 2)
-        rect = np.zeros((4, 2), dtype="float32")
-        s = pts.sum(axis=1)
-        rect[0] = pts[np.argmin(s)]
-        rect[2] = pts[np.argmax(s)]
-        
-        diff = np.diff(pts, axis=1)
-        rect[1] = pts[np.argmin(diff)]
-        rect[3] = pts[np.argmax(diff)]
-        
-        (tl, tr, br, bl) = rect
-        widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
-        widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
-        maxWidth = max(int(widthA), int(widthB))
-        
-        heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
-        heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
-        maxHeight = max(int(heightA), int(heightB))
-        
-        dst = np.array([
-            [0, 0],
-            [maxWidth - 1, 0],
-            [maxWidth - 1, maxHeight - 1],
-            [0, maxHeight - 1]], dtype="float32")
-            
-        M = cv2.getPerspectiveTransform(rect, dst)
-        warped = cv2.warpPerspective(img_bgr, M, (maxWidth, maxHeight))
-        warped_rgb = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)
-        return Image.fromarray(warped_rgb)
+    # --- METHOD 2: Text / Content Region Bounding Box (for light/white backgrounds) ---
+    adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 25, 15)
+    kernel_text = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 7))
+    dilated_text = cv2.dilate(adaptive, kernel_text, iterations=2)
+
+    contours_text, _ = cv2.findContours(dilated_text, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    valid_text_boxes = []
+    for c in contours_text:
+        tx, ty, tw, th = cv2.boundingRect(c)
+        if (tx <= 2 or ty <= 2 or tx + tw >= w - 2 or ty + th >= h - 2) and tw * th < 0.05 * total_area:
+            continue
+        if cv2.contourArea(c) > 50:
+            valid_text_boxes.append((tx, ty, tx + tw, ty + th))
+
+    text_crop = None
+    if valid_text_boxes:
+        t_x1 = max(0, min(b[0] for b in valid_text_boxes) - int(w * 0.03))
+        t_y1 = max(0, min(b[1] for b in valid_text_boxes) - int(h * 0.02))
+        t_x2 = min(w, max(b[2] for b in valid_text_boxes) + int(w * 0.03))
+        t_y2 = min(h, max(b[3] for b in valid_text_boxes) + int(h * 0.02))
+        text_w = t_x2 - t_x1
+        text_h = t_y2 - t_y1
+        if (text_w * text_h) < 0.95 * total_area:
+            text_crop = (t_x1, t_y1, t_x2, t_y2)
+
+    # Apply Crop Selection
+    if paper_crop is not None:
+        x1, y1, x2, y2 = paper_crop
+    elif text_crop is not None:
+        x1, y1, x2, y2 = text_crop
     else:
         return pil_img
+
+    cropped_bgr = img_bgr[y1:y2, x1:x2]
+    cropped_rgb = cv2.cvtColor(cropped_bgr, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(cropped_rgb)
 
 
 def pil_to_b64(pil_img: Image.Image, quality: int = CHUNK_QUAL) -> str:
@@ -293,13 +355,15 @@ uploaded_files = st.file_uploader(
 
 if uploaded_files:
     n = len(uploaded_files)
-    if n == 1:
-        st.image(uploaded_files[0], caption="Receipt", use_container_width=True)
-    else:
-        cols = st.columns(n)
-        for i, f in enumerate(uploaded_files):
-            cols[i].image(f, caption=f"Part {i+1}/{n}", use_container_width=True)
-        st.info(f"📎 {n} images uploaded — will be stitched top-to-bottom before processing.")
+    col_preview, _ = st.columns([1, 2])
+    with col_preview:
+        if n == 1:
+            st.image(uploaded_files[0], caption="Receipt Preview", width=320)
+        else:
+            sub_cols = st.columns(min(n, 2))
+            for i, f in enumerate(uploaded_files):
+                sub_cols[i % 2].image(f, caption=f"Part {i+1}/{n}", width=250)
+            st.info(f"📎 {n} images uploaded — will be stitched top-to-bottom.")
 
     if st.button("🔍 Extract Products", type="primary"):
 
@@ -323,13 +387,17 @@ if uploaded_files:
                 raw_bytes = uf.read()
                 pil_img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
                 
-                # Crop document before OCR
-                cropped_img = crop_document(pil_img)
-                pil_images.append(cropped_img)
-                st.image(cropped_img, caption=f"Cropped Image {idx+1}", use_container_width=True)
-                debug_log.append(f"🖼️ Image {idx+1}: original {pil_img.width}×{pil_img.height}px, cropped to {cropped_img.width}×{cropped_img.height}px")
+                # Stage 1: CLAHE contrast normalization & 4-corner perspective correction
+                scanned_img = scan_and_crop_document(pil_img, enhance_contrast=True)
 
-                lines = run_paddle_ocr(ocr_model, cropped_img)
+                # Stage 2: Production DL document crop & OCR text extraction
+                lines, cropped_img = run_paddle_ocr_and_crop(ocr_model, scanned_img)
+                pil_images.append(cropped_img)
+                
+                col_crop, _ = st.columns([1, 2])
+                with col_crop:
+                    st.image(cropped_img, caption=f"Cropped Image {idx+1}", width=320)
+                debug_log.append(f"🖼️ Image {idx+1}: original {pil_img.width}×{pil_img.height}px, cropped to {cropped_img.width}×{cropped_img.height}px")
                 debug_log.append(f"   → PaddleOCR: {len(lines)} raw lines.")
                 lines = clean_lines(lines)
                 debug_log.append(f"   → After cleaning: {len(lines)} lines.")

@@ -1,0 +1,50 @@
+# Byte-compiled / optimized / DLL files
+__pycache__
+__pycache__/*
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv
+.venv/*
+venv
+venv/*
+env
+env/*
+env.bak/
+venv.bak/
+
+# Environment variables & secrets
+.env
+.env.local
+.env.*.local
+
+# Tool & IDE configurations
+.agents
+.agents/*
+.claude
+.claude/*
+.gemini
+.gemini/*
+.idea
+.idea/*
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Temporary & intermediate OCR output files
+cropped_test.jpg
+ocr_output.jpg
+ocr_output.txt
+final_products.json
+receipt_products.csv
+txt
+
+# Logs & temporary files
+*.log
+*.tmp
+*.temp
+
+# Streamlit config / cache
+.streamlit/secrets.toml
