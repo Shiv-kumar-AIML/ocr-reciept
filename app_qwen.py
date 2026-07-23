@@ -4,12 +4,11 @@ import requests
 import json
 import os
 import re
-import tempfile
 import base64
 import io
-import gc
 import warnings
 import logging
+import time
 import cv2
 import numpy as np
 from PIL import Image
@@ -49,14 +48,16 @@ CHUNK_WIDTH = 900    # max width when chunking
 CHUNK_QUAL  = 78     # JPEG quality per chunk — lower = smaller payload
 
 
-
 # ============================================================
 # HELPERS
 # ============================================================
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner="👁️ Loading PaddleOCR into memory...")
 def get_ocr_model():
     return PaddleOCR(lang="en", use_textline_orientation=True, enable_mkldnn=False)
+
+# Pre-load PaddleOCR on app start (model runs in its own process via cache)
+get_ocr_model()
 
 
 def run_paddle_ocr_and_crop(ocr_model, image_pil: Image.Image) -> tuple[list[str], Image.Image]:
@@ -66,6 +67,14 @@ def run_paddle_ocr_and_crop(ocr_model, image_pil: Image.Image) -> tuple[list[str
     Extracts text line bounding polygons to crop the image tightly around 100% of document content.
     Returns (raw_text_lines, cropped_pil_image).
     """
+    # Downscale very large images before OCR — massive images slow PaddleOCR to 70+ sec
+    # 1800px width keeps all text perfectly readable while cutting OCR time to ~10-15s
+    MAX_OCR_WIDTH = 1800
+    if image_pil.width > MAX_OCR_WIDTH:
+        scale = MAX_OCR_WIDTH / image_pil.width
+        new_h = int(image_pil.height * scale)
+        image_pil = image_pil.resize((MAX_OCR_WIDTH, new_h), Image.LANCZOS)
+
     img_array = np.array(image_pil)
     try:
         with warnings.catch_warnings():
@@ -246,41 +255,43 @@ def pil_to_b64(pil_img: Image.Image, quality: int = CHUNK_QUAL) -> str:
 def call_ollama_with_image(prompt: str, image_b64: str, debug_log: list,
                            label: str = "") -> str:
     """
-    Send prompt + image chunk to Ollama with format json for speed.
+    Send prompt + image to Ollama API (model runs in its own separate process).
     """
+    tag = f"[{label}] " if label else ""
     payload = {
         "model": MODEL_NAME,
         "stream": False,
-        "format": "json",
         "messages": [{"role": "user", "content": prompt, "images": [image_b64]}],
-        "options": {"num_ctx": 4096, "temperature": 0, "num_predict": 1024}
+        "options": {"num_ctx": 2048, "temperature": 0}  # 2048 is enough — OCR text is the main reference
     }
-    tag = f"[{label}] " if label else ""
-    debug_log.append(f"📤 {tag}Sending chunk ({len(image_b64)//1024}KB) with vision to Ollama...")
+    debug_log.append(f"📤 {tag}Sending image ({len(image_b64)//1024}KB) + text to Ollama ({MODEL_NAME})...")
+    t1 = time.perf_counter()
     r = requests.post(OLLAMA_URL, json=payload, timeout=600)
-    debug_log.append(f"   {tag}HTTP {r.status_code}")
+    infer_t = time.perf_counter() - t1
+    debug_log.append(f"   {tag}HTTP {r.status_code} | Ollama inference: {infer_t:.2f}s")
     r.raise_for_status()
     content = r.json().get("message", {}).get("content", "").strip()
-    debug_log.append(f"   {tag}Response length: {len(content)} chars.")
+    debug_log.append(f"   {tag}Response length: {len(content)} chars")
     return content
 
 
 def call_ollama_text_only(prompt: str, debug_log: list, label: str = "") -> str:
-    """Send text-only prompt to Ollama with format json for super fast response."""
+    """Send text-only prompt to Ollama API."""
+    tag = f"[{label}] " if label else ""
     payload = {
         "model": MODEL_NAME,
         "stream": False,
-        "format": "json",
         "messages": [{"role": "user", "content": prompt}],
-        "options": {"num_ctx": 4096, "temperature": 0, "num_predict": 1024}
+        "options": {"num_ctx": 8192, "temperature": 0}
     }
-    tag = f"[{label}] " if label else ""
-    debug_log.append(f"📤 {tag}Sending fast TEXT-ONLY request...")
+    debug_log.append(f"📤 {tag}Sending TEXT-ONLY request to Ollama ({MODEL_NAME})...")
+    t1 = time.perf_counter()
     r = requests.post(OLLAMA_URL, json=payload, timeout=600)
-    debug_log.append(f"   {tag}HTTP {r.status_code}")
+    infer_t = time.perf_counter() - t1
+    debug_log.append(f"   {tag}HTTP {r.status_code} | Ollama inference: {infer_t:.2f}s")
     r.raise_for_status()
     content = r.json().get("message", {}).get("content", "").strip()
-    debug_log.append(f"   {tag}Response length: {len(content)} chars.")
+    debug_log.append(f"   {tag}Response length: {len(content)} chars")
     return content
 
 
@@ -305,6 +316,10 @@ def extract_products_from_response(raw: str) -> list[dict]:
         name = str(p.get("product_name", "")).strip()
         if not name or name.lower() in junk_names or len(name) < 3:
             continue
+        # --- FIX: strip trailing 'X' or 'x' from quantity (model writes '1X', '3X') ---
+        qty = str(p.get("quantity", "1")).strip()
+        qty = re.sub(r'\s*[Xx]$', '', qty).strip()  # remove trailing X e.g. "1X" → "1"
+        p["quantity"] = qty if qty else "1"
         valid.append(p)
     return valid
 
@@ -325,22 +340,28 @@ def deduplicate_products(products: list[dict]) -> list[dict]:
 
 
 PRODUCT_PROMPT_TEMPLATE = """\
-Extract ALL purchased products from receipt OCR text. Do NOT miss any product or barcode.
+You are a receipt data extraction expert. Extract ALL purchased products from this receipt.
 
 {context_note}
 
----OCR TEXT---
+---OCR TEXT (use as reference to verify what you see)---
 {ocr_section}
 ---END OCR TEXT---
 
-RULES:
-1. BARCODE: Look for barcode / product code numbers (digits near or above the product name). Remove any '*' or '#' prefix. If no barcode digits exist, use "".
-2. QUANTITY: Number before 'X' or 'x' (e.g. '3 X' -> '3', '0.450 kg' -> '0.450'). Default to '1' if not specified.
-3. Ignore header, footer, tax, store info, totals, payment details, and Arabic text lines.
-4. Keep line total as 'total_amount' and item unit price as 'price'.
+EXTRACTION RULES:
+1. IMAGE IS PRIMARY: Look at the image to understand the exact column structure of this receipt (Name | Qty | Price | Total). The receipt layout tells you where each value belongs.
+2. OCR TEXT IS REFERENCE: Use the OCR text to get exact spellings, numbers, and barcodes.
+3. PRODUCT NAME: Only the text name of the product. Do NOT include any numbers (qty/price/total) in the name.
+4. BARCODE: A long number (12-14 digits) printed ABOVE the product name line. Remove any '*' or '#'. If missing, use "".
+5. QUANTITY: The count or weight number ONLY — just the digit(s), e.g. "1", "3", "0.43". Do NOT include 'x', 'X', 'kg', or any unit.
+6. PRICE: The unit price column value (number only).
+7. TOTAL_AMOUNT: The line total column value (number only).
+8. Skip: store name, address, TRN, subtotals, taxes, payment lines, Arabic text, coupon lines.
+9. NEEDS_MANUAL_TALLY: Set to true if OCR text is garbled, values are unclear, or you had to guess. Otherwise false.
+10. CONFIDENCE: Be HONEST — give 100 only if every field (name, barcode, qty, price, total) is crystal clear. Give 70-90 if some values needed inference. Give below 70 if OCR was messy.
 
-JSON Output Schema:
-{{"products": [{{"product_name": "string", "barcode": "string", "quantity": "string", "price": "string", "total_amount": "string"}}]}}"""
+Return ONLY valid JSON, no markdown:
+{{"products": [{{"product_name": "string", "barcode": "string", "quantity": "string", "price": "string", "total_amount": "string", "needs_manual_tally": false, "confidence_percentage": 85}}]}}"""
 
 
 # ============================================================
@@ -368,14 +389,17 @@ if uploaded_files:
     if st.button("🔍 Extract Products", type="primary"):
 
         debug_log: list[str] = []
+        pipeline_start = time.perf_counter()
 
         # ====================================================
-        # STEP 1 — PaddleOCR on every uploaded image
+        # STEP 1 — PaddleOCR on every uploaded image 
         # ====================================================
         with st.spinner(f"Step 1/2: PaddleOCR reading {n} image(s)..."):
             try:
+                t_load0 = time.perf_counter()
                 ocr_model = get_ocr_model()
-                debug_log.append("✅ PaddleOCR model loaded.")
+                t_load1 = time.perf_counter()
+                debug_log.append(f"✅ PaddleOCR model loaded (cache hit: {t_load1-t_load0:.2f}s)")
             except Exception as e:
                 st.error(f"❌ Failed to load PaddleOCR: {e}")
                 st.stop()
@@ -388,19 +412,26 @@ if uploaded_files:
                 pil_img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
                 
                 # Stage 1: CLAHE contrast normalization & 4-corner perspective correction
+                t_crop0 = time.perf_counter()
                 scanned_img = scan_and_crop_document(pil_img, enhance_contrast=True)
+                t_crop1 = time.perf_counter()
+                debug_log.append(f"✂️  Image {idx+1} scan+crop (OpenCV): {t_crop1-t_crop0:.2f}s")
 
                 # Stage 2: Production DL document crop & OCR text extraction
+                t_ocr0 = time.perf_counter()
                 lines, cropped_img = run_paddle_ocr_and_crop(ocr_model, scanned_img)
+                t_ocr1 = time.perf_counter()
                 pil_images.append(cropped_img)
                 
                 col_crop, _ = st.columns([1, 2])
                 with col_crop:
                     st.image(cropped_img, caption=f"Cropped Image {idx+1}", width=320)
-                debug_log.append(f"🖼️ Image {idx+1}: original {pil_img.width}×{pil_img.height}px, cropped to {cropped_img.width}×{cropped_img.height}px")
-                debug_log.append(f"   → PaddleOCR: {len(lines)} raw lines.")
+                debug_log.append(f"🖼️ Image {idx+1}: original {pil_img.width}×{pil_img.height}px → cropped to {cropped_img.width}×{cropped_img.height}px")
+                debug_log.append(f"👁️  PaddleOCR inference: {t_ocr1-t_ocr0:.2f}s → {len(lines)} raw lines")
+                t_clean0 = time.perf_counter()
                 lines = clean_lines(lines)
-                debug_log.append(f"   → After cleaning: {len(lines)} lines.")
+                t_clean1 = time.perf_counter()
+                debug_log.append(f"🧹 Line cleaning: {t_clean1-t_clean0:.3f}s → {len(lines)} clean lines")
 
                 if n > 1:
                     all_ocr_lines.append(f"--- IMAGE {idx+1} ---")
@@ -409,10 +440,10 @@ if uploaded_files:
             full_ocr_text = "\n".join(all_ocr_lines)
 
             # Stitch all uploaded images into one tall canvas
+            t_stitch0 = time.perf_counter()
             combined_pil = stitch_images(pil_images) if n > 1 else pil_images[0]
-            debug_log.append(
-                f"🖼️ Stitched image: {combined_pil.width}×{combined_pil.height}px"
-            )
+            t_stitch1 = time.perf_counter()
+            debug_log.append(f"🖼️  Stitch images: {t_stitch1-t_stitch0:.3f}s → {combined_pil.width}×{combined_pil.height}px")
 
             # We rely on @st.cache_resource to manage PaddleOCR memory
             # Do NOT clear the cache here, as repeatedly reloading PaddleOCR causes memory leaks!
@@ -437,10 +468,16 @@ if uploaded_files:
             # We pass the full extracted OCR text
             ocr_text_flat = "\n".join([l for l in all_ocr_lines if not l.startswith("---")])
 
-            prompt = PRODUCT_PROMPT_TEMPLATE.format(
-                context_note="This is the full extracted receipt document.",
-                ocr_section=ocr_text_flat
-            )
+            if use_fast_mode:
+                prompt = PRODUCT_PROMPT_TEMPLATE.format(
+                    context_note="No image available. Use only the OCR text below to extract all products. Infer the receipt structure from patterns in the text (barcodes above names, numbers at end of lines are qty/price/total).",
+                    ocr_section=ocr_text_flat
+                )
+            else:
+                prompt = PRODUCT_PROMPT_TEMPLATE.format(
+                    context_note="The receipt IMAGE is attached. USE THE IMAGE as your primary source to understand the column layout (Name | Qty | Price | Total). Then cross-reference with the OCR text below for exact values.",
+                    ocr_section=ocr_text_flat
+                )
 
             chunk_label = "Receipt Data"
             raw = ""
@@ -452,8 +489,18 @@ if uploaded_files:
                     debug_log.append(f"❌ {chunk_label} fast text call failed: {e}")
                     raw = ""
             else:
-                b64 = pil_to_b64(combined_pil)
-                debug_log.append(f"📦 Final Image: {combined_pil.width}×{combined_pil.height}px, base64={len(b64)//1024}KB")
+                t_b64_0 = time.perf_counter()
+                # Shrink image for vision LLM — model needs structure, not pixel-perfect quality
+                # 600px width: base64 ~80KB vs 431KB → ~3x faster Ollama inference
+                llm_img = combined_pil.copy()
+                MAX_LLM_WIDTH = 600
+                if llm_img.width > MAX_LLM_WIDTH:
+                    scale = MAX_LLM_WIDTH / llm_img.width
+                    llm_img = llm_img.resize((MAX_LLM_WIDTH, int(llm_img.height * scale)), Image.LANCZOS)
+                b64 = pil_to_b64(llm_img, quality=60)  # lower quality = smaller size, still readable
+                t_b64_1 = time.perf_counter()
+                debug_log.append(f"🗜️  Base64 encode: {t_b64_1-t_b64_0:.3f}s → {len(b64)//1024}KB (LLM image: {llm_img.width}×{llm_img.height}px)")
+                debug_log.append(f"📦 Original cropped: {combined_pil.width}×{combined_pil.height}px")
                 try:
                     raw = call_ollama_with_image(prompt, b64, debug_log, chunk_label)
                 except Exception as e:
@@ -464,12 +511,16 @@ if uploaded_files:
                         debug_log.append(f"❌ {chunk_label} text-only fallback failed: {ex}")
                         raw = ""
 
+            t_parse0 = time.perf_counter()
             chunk_products = extract_products_from_response(raw)
-            debug_log.append(f"   → {chunk_label}: {len(chunk_products)} products extracted.")
+            t_parse1 = time.perf_counter()
+            debug_log.append(f"🔍 JSON parse: {t_parse1-t_parse0:.3f}s → {len(chunk_products)} products from {chunk_label}")
             all_products.extend(chunk_products)
 
             products = deduplicate_products(all_products)
+            total_t = time.perf_counter() - pipeline_start
             debug_log.append(f"✅ Total unique products: {len(products)}")
+            debug_log.append(f"⏱️  ══ TOTAL PIPELINE TIME: {total_t:.2f}s ══")
 
         # ====================================================
         # RESULTS
@@ -479,15 +530,16 @@ if uploaded_files:
         else:
             df = pd.DataFrame(products)
             st.success(f"✅ Done! **{len(df)} products** extracted.")
-            st.dataframe(df, use_container_width=True)
+            # Use data_editor so users can view the flag and tally/edit manually
+            edited_df = st.data_editor(df, use_container_width=True, num_rows="dynamic")
             st.download_button(
                 "⬇️ Download CSV",
-                df.to_csv(index=False).encode("utf-8"),
+                edited_df.to_csv(index=False).encode("utf-8"),
                 file_name="receipt_products.csv",
                 mime="text/csv"
             )
             with st.expander("📋 Full JSON Output"):
-                st.json({"products": products})
+                st.json({"products": edited_df.to_dict(orient="records")})
 
         with st.expander("🐛 Debug Log (click to inspect every step)"):
             st.text("\n".join(debug_log))
